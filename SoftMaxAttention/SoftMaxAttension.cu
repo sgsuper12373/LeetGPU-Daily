@@ -5,57 +5,59 @@
 using namespace std; 
 
 
+__global__ void matrix_mult_kernel(const float* A, const float* B, float* output, int M, int N, int K, float scale) {
+    int col = threadIdx.x + blockIdx.x * blockDim.x; 
+    int row = threadIdx.y + blockIdx.y * blockDim.y; 
 
-__global__ void matrix_mult_kernel( const float* A, const float* B, float* output, int M , int N, int K, float scale){
+    if (col >= N || row >= M) return; 
 
-    // A = M*K 
-    // B = K*N 
-    
-    int col = threadIdx.x + blockIdx.x*blockDim.x; // column
-    int row = threadIdx.y + blockIdx.y*blockDim.y; // row 
-
-    if( col >= N || row >= M ) return ; 
-
-    // to calculate the output[x][y] multiply the xth row of A with yth columsn of B 
-    // output matrix initilized with 0's
     float sum = 0.0f;
-    for( int i = 0 ; i < K; i++ ){
-        sum += ( A[ row*K + i ] * B[ i*N + col] ); 
+    for (int i = 0; i < K; i++) {
+        sum += (A[row * K + i] * B[i * N + col]); 
     }
-    output[row*N+ col] = sum/scale ; 
+    output[row * N + col] = sum / scale; 
 }
 
-__global__ void matrix_transpose_kernel( const float* A, float* B, int M , int N ){
+__global__ void matrix_transpose_kernel(const float* A, float* B, int M, int N) {
+    int col = threadIdx.x + blockDim.x * blockIdx.x; 
+    int row = threadIdx.y + blockDim.y * blockIdx.y; 
 
-    int col = threadIdx.x + blockDim.x*blockIdx.x; // column
-    int row = threadIdx.y + blockDim.y*blockIdx.y; // row 
+    if (col >= N || row >= M) return; 
 
-    // if gid goes outof bound exit the thread 
-    if( col >= N || row >= M ) return; 
-
-    B[ col*M+ row] = A[ row*N + col]; 
-
+    B[col * M + row] = A[row * N + col]; 
 }
 
+// New kernel to apply softmax row-wise
+__global__ void softmax_kernel(float* mat, int M, int N) {
+    // One thread per row for simplicity 
+    int row = blockIdx.x * blockDim.x + threadIdx.x;
+    if (row >= M) return;
 
+    // Find the maximum value in the row for numerical stability
+    float max_val = mat[row * N];
+    for (int i = 1; i < N; i++) {
+        max_val = fmaxf(max_val, mat[row * N + i]);
+    }
 
-extern void solve (const float*Q, const float* K , const float* V, float* output,  int M, int N , int d ){
-    // first multiply the matrix Q and matrix K multiply each element by root d and then multiply with v 
-    /*
-        The plan is that we create general matrix multiplication function which takes input matrix A, B and their sizes with extra parameter scale 
-        Then we need some other method to transpose the input matrix K, 
-        but if we don't want to calculate the transpose then we 
+    // Compute exponents and sum
+    float sum_exp = 0.0f;
+    for (int i = 0; i < N; i++) {
+        float e = expf(mat[row * N + i] - max_val);
+        mat[row * N + i] = e;
+        sum_exp += e;
+    }
 
-        Q of size M×d
-        K of size N×d
-        V of size N×d
-    */
+    // Normalize the row
+    for (int i = 0; i < N; i++) {
+        mat[row * N + i] /= sum_exp;
+    }
+}
 
+extern "C" void solve(const float* Q, const float* K, const float* V, float* output, int M, int N, int d) {
     dim3 TPB(16, 16);
-
-    dim3 transposeBlocks((d + 15) / 16,(N + 15) / 16);
-    dim3 qktBlocks((N + 15) / 16,(M + 15) / 16);
-    dim3 outputBlocks( (d + 15) / 16, (M + 15) / 16);
+    dim3 transposeBlocks((d + 15) / 16, (N + 15) / 16);
+    dim3 qktBlocks((N + 15) / 16, (M + 15) / 16);
+    dim3 outputBlocks((d + 15) / 16, (M + 15) / 16);
 
     float* d_KT;
     float* temp_res;
@@ -63,22 +65,22 @@ extern void solve (const float*Q, const float* K , const float* V, float* output
     cudaMalloc(&d_KT, N * d * sizeof(float));
     cudaMalloc(&temp_res, M * N * sizeof(float));
 
-    matrix_transpose_kernel<<<transposeBlocks, TPB>>>(
-        K, d_KT, N, d
-    );
+    // 1. K Transpose
+    matrix_transpose_kernel<<<transposeBlocks, TPB>>>(K, d_KT, N, d);
 
-    matrix_mult_kernel<<<qktBlocks, TPB>>>(
-        Q, d_KT, temp_res,
-        M, N, d, sqrt(d)
-    );
+    // 2. Q * K^T / sqrt(d)
+    matrix_mult_kernel<<<qktBlocks, TPB>>>(Q, d_KT, temp_res, M, N, d, sqrtf(d));
 
-    matrix_mult_kernel<<<outputBlocks, TPB>>>(
-        temp_res, V, output,
-        M, d, N, 1.0f
-    );
+    // 3. Apply Softmax row-wise to temp_res (M rows)
+    int softmax_threads = 256;
+    int softmax_blocks = (M + softmax_threads - 1) / softmax_threads;
+    softmax_kernel<<<softmax_blocks, softmax_threads>>>(temp_res, M, N);
+
+    // 4. (Softmax Result) * V
+    matrix_mult_kernel<<<outputBlocks, TPB>>>(temp_res, V, output, M, d, N, 1.0f);
+
     cudaFree(temp_res); 
     cudaFree(d_KT); 
-
 }
 
 
@@ -122,6 +124,25 @@ void matrix_mult_host(const float* A, const float* B, float* C, int M, int N, in
     }
 }
 
+void softmax_host(float* matrix, int M, int N) {
+    for (int row = 0; row < M; row++) {
+        float max_value = matrix[row * N];
+        for (int col = 1; col < N; col++) {
+            max_value = max(max_value, matrix[row * N + col]);
+        }
+
+        float sum_exp = 0.0f;
+        for (int col = 0; col < N; col++) {
+            matrix[row * N + col] = exp(matrix[row * N + col] - max_value);
+            sum_exp += matrix[row * N + col];
+        }
+
+        for (int col = 0; col < N; col++) {
+            matrix[row * N + col] /= sum_exp;
+        }
+    }
+}
+
 
 void solve_cpu(float* Q, float* K ,float* V, float* output,  int M, int N , int d ){
     float* KT = (float*)malloc(d*N*sizeof(float)); 
@@ -132,6 +153,7 @@ void solve_cpu(float* Q, float* K ,float* V, float* output,  int M, int N , int 
     // KT = N*d
     // temp res = M*N
     matrix_mult_host(Q,KT,temp_res,M,N,d,sqrt(d)); 
+    softmax_host(temp_res, M, N);
 
     // temp res = M*N
     // V = N*d
