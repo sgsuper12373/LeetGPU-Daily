@@ -14,14 +14,15 @@ __global__ void matrix_mult_kernel( const float* A, const float* B, float* outpu
     int col = threadIdx.x + blockIdx.x*blockDim.x; // column
     int row = threadIdx.y + blockIdx.y*blockDim.y; // row 
 
-    if( col >= N || row >= M )
+    if( col >= N || row >= M ) return ; 
 
     // to calculate the output[x][y] multiply the xth row of A with yth columsn of B 
     // output matrix initilized with 0's
+    float sum = 0.0f;
     for( int i = 0 ; i < K; i++ ){
-        output[row*N + col] += ( A[ row*N + i ] * B[ i*M + col] ); 
+        sum += ( A[ row*K + i ] * B[ i*N + col] ); 
     }
-    output[row*N+ col] /= scale ; 
+    output[row*N+ col] = sum/scale ; 
 }
 
 __global__ void matrix_transpose_kernel( const float* A, float* B, int M , int N ){
@@ -75,55 +76,69 @@ extern void solve (const float*Q, const float* K , const float* V, float* output
         temp_res, V, output,
         M, d, N, 1.0f
     );
-
+    cudaFree(temp_res); 
+    cudaFree(d_KT); 
 
 }
 
 
-void assign_rand_val(vector<vector<float>>& A){
-    for( int i = 0 ; i < A.size(); i++ ){
-        for( int j = 0; j < A[0].size(); j++ ){
-            A[i][j]= (float)rand()/RAND_MAX; 
+void assign_rand_val(float* A, int M, int N){
+    for( int i = 0 ; i < M; i++ ){
+        for( int j = 0; j < N; j++ ){
+            A[i*N+j]= (float)rand()/(float)RAND_MAX; 
         }
     }
 }
 
 
-void matrix_tranpose_cpu(const vector<vector<float>>& A, vector<vector<float>>&B){
+void matrix_tranpose_cpu(float* A, float* B, int M, int N ){
     // A = M*N 
     // B = N*M
-    int M = A.size(); 
-    int N = A[0].size(); 
     for( int i = 0 ; i < M; i++ ){
         for( int j = 0; j < N ; j++ ){
-            B[j][i] = A[i][j]; 
+            B[j*M + i] = A[i*N + j]; 
         }
     }
 }
 
-void matrix_mult_host( const vector<vector<float>>&A, const vector<vector<float>>&B, vector<vector<float>>& C, float scale ){
-    // A = M*d
-    // B = d*N
-    int M = A.size(); 
-    int d = A[0].size(); 
-    int N = B[0].size(); 
 
-    for( int i = 0 ; i < M ; i++ ){
-        for( int j = 0; j < N ; j++ ){
-            for( int k = 0 ; k < d ; k++ ){
-                C[i][j] += A[i][k] * B[k][j]; 
+void matrix_mult_host(const float* A, const float* B, float* C, int M, int N, int d, float scale) {
+    // A = M * d
+    // B = d * N
+    // C = M * N
+
+    for (int i = 0; i < M; i++) {
+        for (int j = 0; j < N; j++) {
+            float sum = 0.0f;
+            
+            for (int k = 0; k < d; k++) {
+                // A has width 'd', B has width 'N'
+                sum += A[i * d + k] * B[k * N + j]; 
             }
+            
+            // C has width 'N'. Write the final scaled sum once.
+            C[i * N + j] = sum / scale; 
         }
     }
 }
 
 
-void solve_cpu(const vector<vector<float>>&Q, const vector<vector<float>>& K , const vector<vector<float>>&V, vector<vector<float>>&output,  int M, int N , int d ){
-    vector<vector<float>> KT(d,vector<float>(N)); 
-    vector<vector<float>> temp_res(M,vector<float>(d,0)); 
-    matrix_tranpose_cpu(K,KT); 
-    matrix_mult_host(Q,KT,temp_res,sqrt(d)); 
-    matrix_mult_host(temp_res,V,output,1);
+void solve_cpu(float* Q, float* K ,float* V, float* output,  int M, int N , int d ){
+    float* KT = (float*)malloc(d*N*sizeof(float)); 
+    float* temp_res = (float*) malloc(M*N*sizeof(float)); 
+    matrix_tranpose_cpu(K,KT,N,d); 
+
+    // Q = M*d
+    // KT = N*d
+    // temp res = M*N
+    matrix_mult_host(Q,KT,temp_res,M,N,d,sqrt(d)); 
+
+    // temp res = M*N
+    // V = N*d
+    // output = M*d
+    matrix_mult_host(temp_res,V,output,M,d,N,1);
+    free(KT); 
+    free(temp_res); 
 }
 
 
@@ -132,17 +147,17 @@ int main(){
     int M = 40, N = 20, d = 12 ;
 
     // declare Host varaibles 
-    vector<vector<float>> h_Q(M,vector<float>(d,0)); 
-    vector<vector<float>> h_K(N,vector<float>(d,0)); 
-    vector<vector<float>> h_V(N,vector<float>(d,0)); 
-    vector<vector<float>> h_out(M,vector<float>(d,0)); 
-    vector<vector<float>> glolden_trace(M,vector<float>(d,0)); 
+    float* h_Q  =   (float*)malloc(M*d*sizeof(float)); 
+    float* h_K  =   (float*)malloc(N*d*sizeof(float)); 
+    float* h_V  =   (float*)malloc(N*d*sizeof(float)); 
+    float* h_out =  (float*)malloc(M*d*sizeof(float)); 
+    float* glolden_trace = (float*)malloc(M*d*sizeof(float)); 
     
 
     // initilize Host arrays 
-    assign_rand_val(h_Q); 
-    assign_rand_val(h_K); 
-    assign_rand_val(h_V); 
+    assign_rand_val(h_Q,M,d); 
+    assign_rand_val(h_K,N,d); 
+    assign_rand_val(h_V,N,d); 
 
 
     // Declare Device Varaibles and assign memory
@@ -153,30 +168,44 @@ int main(){
     cudaMalloc(&d_out,M*d*sizeof(float)); 
 
     // copy Host data to Device 
-    cudaMemcpy(d_Q, h_Q.data(), M*d*sizeof(float), cudaMemcpyHostToDevice);
-    cudaMemcpy(d_K, h_Q.data(), N*d*sizeof(float), cudaMemcpyHostToDevice);
-    cudaMemcpy(d_V, h_Q.data(), N*d*sizeof(float), cudaMemcpyHostToDevice);
-    cudaMemcpy(d_out, h_Q.data(), M*d*sizeof(float), cudaMemcpyHostToDevice);
+    cudaMemcpy(d_Q, h_Q, M*d*sizeof(float), cudaMemcpyHostToDevice);
+    cudaMemcpy(d_K, h_K, N*d*sizeof(float), cudaMemcpyHostToDevice);
+    cudaMemcpy(d_V, h_V, N*d*sizeof(float), cudaMemcpyHostToDevice);
+    cudaMemcpy(d_out, h_out, M*d*sizeof(float), cudaMemcpyHostToDevice);
 
     // call the solve function 
     solve(d_Q,d_K,d_V,d_out,M,N,d);
 
     // copy results back to host 
-    cudaMemcpy(h_Q.data(),d_out,  M*d*sizeof(float), cudaMemcpyDeviceToDevice);
+    cudaMemcpy(h_out,d_out,  M*d*sizeof(float), cudaMemcpyDeviceToHost);
 
     // compute the golder results 
     solve_cpu(h_Q,h_K,h_V,glolden_trace,M,N,d);
 
     for( int i = 0 ; i < M ; i++ ){
         for( int j =0 ; j < d; j++ ){
-            if( fabs(h_K[i][j] - glolden_trace[i][j]) >= 1e-5){
+            if( fabs(h_out[i*d + j] - glolden_trace[i*d + j]) >= 1e-5){
                 cout << "CPU and GPU error diff is greater than bounds \n"; 
+                
+                cudaFree(d_K); 
+                cudaFree(d_V); 
+                cudaFree(d_Q); 
+                cudaFree(d_out); 
+
                 return 0; 
             }
         }
     }
 
     cout << "Result of CPU and GPU matches succesfully \n"; 
+    cudaFree(d_K); 
+    cudaFree(d_V); 
+    cudaFree(d_Q); 
+    cudaFree(d_out); 
+    free(h_Q); 
+    free(h_K); 
+    free(h_V); 
+    free(h_out); 
 
     return 0; 
 }
