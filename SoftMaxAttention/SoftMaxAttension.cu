@@ -1,3 +1,18 @@
+/**
+ * @file SoftMaxAttension.cu
+ * @author Sumit Garad (sgsuper12373@gmail.com); 
+ * @brief  Took more than 3 hours to solve. almost 2 hours wasted because I was doing (Q^k_t/root(d))*V 
+ *         instead of softmax(Q^k_t/root(d))*V 
+ * @todo IMPROVE THE MATRIX MULTIPLICATION USING THE SHARED MEMORY AND CHECK FOR ALTERNATIVE 
+ *         IF THE Q^K_t CAN BE DONE WITHOUT TRANSPOSEING MATRIX K 
+ * @version 0.1
+ * @date 2026-09-03
+ * 
+ * @copyright Copyright (c) 2026
+ * 
+ */
+
+
 #include<cuda.h> 
 #include<cuda_runtime.h> 
 #include<bits/stdc++.h> 
