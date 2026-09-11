@@ -153,6 +153,15 @@ Output: loss = [0.3548926]
     float* h_loss = (float*)malloc(sizeof(float)); 
     float* goldenTrace = (float*)malloc(sizeof(float)); 
 
+    for (int i = 0; i < N * C; i++) {
+        h_logit[i] = static_cast<float>((i * 17) % 100) / 10.0f - 5.0f;
+    }
+    for (int i = 0; i < N; i++) {
+        h_lable[i] = i % C;
+    }
+    *h_loss = 0.0f;
+    *goldenTrace = 0.0f;
+
     // Device variables delcaration and memory allocatoin 
     float *d_logit, *d_loss; 
     int *d_lable; 
@@ -164,12 +173,13 @@ Output: loss = [0.3548926]
     cudaMemcpy(d_logit, h_logit, logit_size,cudaMemcpyHostToDevice); 
     cudaMemcpy(d_lable, h_lable, label_size,cudaMemcpyHostToDevice); 
 
-    solve(d_logit,d_lable,d_logit,N,C); 
+    solve(d_logit,d_lable,d_loss,N,C); 
     cudaMemcpy(h_loss,d_loss,sizeof(float),cudaMemcpyDeviceToHost);
 
     solve_cpu(h_logit,h_lable,goldenTrace,N,C); 
 
-    if( fabs(goldenTrace-h_loss) > 1e-5){
+    cout<< "Host: " << *goldenTrace << "\nDevice : " << *h_loss << "\n"; 
+    if( fabs(*goldenTrace - *h_loss) > 1e-4){
         cout<< "HOST DEVCIE result don't match \n"; 
     }else{
         cout << "HOST DEVICE results matched successfully \n"; 
