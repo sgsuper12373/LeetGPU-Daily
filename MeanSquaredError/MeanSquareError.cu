@@ -6,6 +6,45 @@
 using namespace std; 
 
 
+/**
+ * @brief Reduction based MSE loss function. 
+ *        store the diff to the  shared array and the do parallel reduction 
+ * 
+ * @param predictions 
+ * @param targets 
+ * @param mse 
+ * @param N 
+ * @return __global__ 
+ */
+__global__ void MSE_kernel_v2(const float* predictions, const float* targets, float* mse, int N){
+    extern __shared__ float sdata[];
+    int tid = threadIdx.x; 
+    int gid = threadIdx.x + blockDim.x*blockIdx.x; 
+
+    // store the diff in block_local array 
+    if( gid < N ){
+        float diff = predictions[gid] - targets[gid]; 
+        sdata[tid] = diff*diff; 
+    }else{
+        sdata[tid] = 0 ; 
+    }
+
+    // wait for all threads to load the data 
+    __syncthreads(); 
+
+    // paralllel reduction 
+    for( int stride = blockDim.x/2 ; stride > 0 ; stride /= 2 ){
+        if( tid < stride ){
+            sdata[tid] += sdata[tid+stride]; 
+        }
+        __syncthreads();
+    }
+
+    if( tid == 0 ) {
+        atomicAdd(mse,sdata[0]/N); 
+    }
+}
+
 __global__ void MSE_kernel_v1(const float* predictions, const float* targets, float* mse, int N){
 
     __shared__ float sdata; 
@@ -15,11 +54,12 @@ __global__ void MSE_kernel_v1(const float* predictions, const float* targets, fl
     if( tid == 0 ) sdata = 0.0f; 
     __syncthreads(); 
 
-    if( gid >= N ) return; 
+    if( gid < N ) {
+        // data race hence use atomic add 
+        // sdata += (predictions[gid]-targets[gid])*(predictions[gid]-targets[gid]); 
+        atomicAdd(&sdata,(predictions[gid]-targets[gid])*(predictions[gid]-targets[gid])); 
+    }
 
-    // data race hence use atomic add 
-    // sdata += (predictions[gid]-targets[gid])*(predictions[gid]-targets[gid]); 
-    atomicAdd(&sdata,(predictions[gid]-targets[gid])*(predictions[gid]-targets[gid])); 
 
     __syncthreads(); 
 
@@ -31,13 +71,17 @@ __global__ void MSE_kernel_v1(const float* predictions, const float* targets, fl
 extern "C" void solve(const float* predictions, const float* targets, float* mse, int N) {
     int TPB = 256; 
     int Blocks = (N+TPB-1)/TPB; 
+    int shrdBytes = TPB*sizeof(float); 
 
     // mse should be zero before computation 
-    *mse = 0.0f; 
+    cudaMemset(mse, 0, sizeof(float));
 
     // v1 is basically squental because of atomics. we can use something like reduction...
     // of each thread will compute local sum and update globally using atomic 
-    MSE_kernel_v1<<<Blocks,TPB>>>(predictions,targets,mse,N); 
+    // MSE_kernel_v1<<<Blocks,TPB>>>(predictions,targets,mse,N); 
+
+    MSE_kernel_v2<<<Blocks,TPB,shrdBytes>>>(predictions,targets,mse,N); 
+
     cudaDeviceSynchronize(); 
 
 }
@@ -96,7 +140,7 @@ int main(){
     // CPU results 
     solve_cpu(h_pred,h_trgt,goldenTrace,N); 
 
-    
+
     cout << "HOST: " << *goldenTrace << "\n"; 
     cout << "DEVICE: " << *h_MSE << "\n"; 
     if( fabs(*goldenTrace - *h_MSE) > 1e-4){
