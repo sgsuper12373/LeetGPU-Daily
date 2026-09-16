@@ -1,121 +1,120 @@
-#include<iostream> 
-#include<cuda.h> 
-#include<cuda_runtime.h>
+#include <bits/stdc++.h>
+#include <cuda.h>
+#include <cuda_runtime.h>
 
-using namespace std; 
+using namespace std;
 
-/**
- * @brief My basic Idea is to sort the array in descending order and pick the first k  elements...
- *        This could be lil hard as we are talking about array large enough that can occupy the multiple blocks. 
- *        Lets think from the block level array perspective -> sort the block array and update it in the global array 
- *        now I what I want to do is something like merge sort but expect I more than two array to work 
- *        
- *        // in each block thread 0 checks the largest element and looks for global element and update if it's larger than current element 
- *           this is done atomically. we have some global index to track current position we are trying to fill in. 
- *           by given input constraints  1 ≤ N ≤ 100,000,000 && 1 ≤ k ≤ N
- *        
- *        -> What if I sort them on block level and then some other kernel to merge them using some strided access? 
- *              b1 b2 b3 b4 b5 b6  
- *              phase 1 
- *                 merge b1 and b2 into b1 
- *                 merge b3 and b4 into b3 
- *                 merge b5 and b6 into b5
- *              phase 2 
- *                  merge b1 and b3 
- *                  merge b5 and nothing -> b5 
- *              phase3 
- *                  merge b1 and b5 
- *         Here I guess merge can be some device function which does the two pointer merge thing 
- *         some other kernel will do the merge part 
- */
+#define TILE_SIZE 256
 
-
-
-
-
-__global__ void block_sort( float* input, int N){
-    // merge sort feels bad Idea here due to recursion and GPU have less stack memory so there could be stack overflow 
-    // use shared memory to load the array. sort and write back into the global array 
-
-    extern __shared__ float sdata[]; 
-
-    int tid = threadIdx.x; 
-    int gid = threadIdx.x + blockDim.x*blockIdx.x; 
-
-    // load data into the local memory 
-    if( gid < N ){
-        sdata[tid] = input[gid]; 
-    }else{
-        sdata[tid] = -INFINITY; // we are sorting in descending order hence this is best we can do 
-    }
-
-    // wait !! for all threads to load the data 
-    __syncthreads(); 
-
-    // now do the sort -> optimzed selection sort with flag which stops if next array is already sorted 
-    
-    int arr_size = blockDim.x;
-
-    for (int i = 0; i < arr_size - 1; i++) {
-
-        int curr_max_ind = i;
-
-        for (int j = i + 1; j < arr_size; j++) {
-            if (sdata[j] > sdata[curr_max_ind]) {
-                curr_max_ind = j;
-            }
-        }
-
-        if (curr_max_ind != i) {
-            float temp = sdata[i];
-            sdata[i] = sdata[curr_max_ind];
-            sdata[curr_max_ind] = temp;
-        }
-    }
-
-    // update the global array to this blocked sorted array 
-    if( gid  < N ){
-        input[gid] = sdata[tid]; 
-    }
-
+template<typename T>
+__device__ void swap_values(T& a, T& b) {
+    T tmp = a;
+    a = b;
+    b = tmp;
 }
 
-__global__ void block_merge(float* input, int b1, int b2,  int N ){
+__global__ void bitonic_sort_kernel(float* input, int sort_k, int p, int N) {
+    int a_idx = blockIdx.x * blockDim.x + threadIdx.x;
+    int b_idx = a_idx ^ p;
 
+    if (a_idx >= N || b_idx >= N) {
+        return;
+    }
+
+    if (b_idx > a_idx) {
+        if ((a_idx & sort_k) ? input[a_idx] > input[b_idx] : input[a_idx] < input[b_idx]) {
+            swap_values(input[a_idx], input[b_idx]);
+        }
+    }
 }
-
-
-
 
 extern "C" void solve(const float* input, float* output, int N, int k) {
-    int TPB = 512; 
-    int Blokcs = N/TPB; 
-    size_t shrdBytes = TPB*sizeof(float); 
+    if (input == nullptr || output == nullptr || N <= 0 || k <= 0) {
+        return;
+    }
 
-    // temprory input array 
-    float* temp; 
-    cudaMalloc(&temp,N*sizeof(float)); 
-    cudaMemcpy(temp,input,N*sizeof(float),cudaMemcpyDeviceToDevice); 
+    k = min(k, N);
 
-    // sort block 
-    block_sort(temp,N); 
+    int padded_N = 1;
+    while (padded_N < N) {
+        padded_N <<= 1;
+    }
 
-    // block merge 
-    int stride = Blokcs/2; 
-    while( stride > 0 ){
-        for( int i = 0 ; i < stride ; i++ ){
-            block_merge(temp,i,i+stride,N);
+    float* d_padded = nullptr;
+    cudaMalloc(&d_padded, padded_N * sizeof(float));
+
+    vector<float> h_padded(padded_N, -FLT_MAX);
+    for (int i = 0; i < N; i++) {
+        h_padded[i] = input[i];
+    }
+
+    cudaMemcpy(d_padded, h_padded.data(), padded_N * sizeof(float), cudaMemcpyHostToDevice);
+
+    int blocks = (padded_N + TILE_SIZE - 1) / TILE_SIZE;
+    for (int sort_k = 2; sort_k <= padded_N; sort_k <<= 1) {
+        for (int p = sort_k >> 1; p > 0; p >>= 1) {
+            bitonic_sort_kernel<<<blocks, TILE_SIZE>>>(d_padded, sort_k, p, padded_N);
         }
     }
 
+    vector<float> h_sorted(padded_N, -FLT_MAX);
+    cudaMemcpy(h_sorted.data(), d_padded, padded_N * sizeof(float), cudaMemcpyDeviceToHost);
 
-    
+    partial_sort(h_sorted.begin(), h_sorted.begin() + k, h_sorted.end(), greater<float>());
+
+    vector<float> h_topk(k);
+    copy(h_sorted.begin(), h_sorted.begin() + k, h_topk.begin());
+
+    cudaMemcpy(output, h_topk.data(), k * sizeof(float), cudaMemcpyHostToDevice);
+    cudaFree(d_padded);
 }
 
+int main() {
+    int N = 16;
+    int k = 5;
 
+    vector<float> h_input(N);
+    for (int i = 0; i < N; i++) {
+        h_input[i] = (float)rand() / (float)RAND_MAX * 100.0f;
+    }
 
-int main(){
+    vector<float> h_expected = h_input;
+    partial_sort(h_expected.begin(), h_expected.begin() + k, h_expected.end(), greater<float>());
 
+    float* d_input = nullptr;
+    float* d_output = nullptr;
 
-    return 0; 
+    cudaMalloc(&d_input, N * sizeof(float));
+    cudaMalloc(&d_output, k * sizeof(float));
+
+    cudaMemcpy(d_input, h_input.data(), N * sizeof(float), cudaMemcpyHostToDevice);
+    solve(d_input, d_output, N, k);
+
+    vector<float> h_output(k);
+    cudaMemcpy(h_output.data(), d_output, k * sizeof(float), cudaMemcpyDeviceToHost);
+
+    bool matches = true;
+    for (int i = 0; i < k; i++) {
+        if (fabs(h_output[i] - h_expected[i]) > 1e-4f) {
+            matches = false;
+            break;
+        }
+    }
+
+    cout << "Top K values on GPU: ";
+    for (int i = 0; i < k; i++) {
+        cout << h_output[i] << " ";
+    }
+    cout << "\n";
+
+    if (matches) {
+        cout << "Top-K result matches the host reference.\n";
+    } else {
+        cout << "Top-K result does not match the host reference.\n";
+    }
+
+    cudaFree(d_input);
+    cudaFree(d_output);
+
+    return 0;
 }
